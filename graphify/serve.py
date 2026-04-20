@@ -1,6 +1,7 @@
 # MCP stdio server - exposes graph query tools to Claude and other agents
 from __future__ import annotations
 import json
+import os
 import sys
 from pathlib import Path
 import networkx as nx
@@ -45,16 +46,176 @@ def _strip_diacritics(text: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
-def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
+# --- agents-brain fork: EN↔RU matching ------------------------------------
+#
+# Built-in bidirectional tech-term map. Keep small — only dev/infra terms that
+# show up as god-nodes across projects. For everything else, librarian writes
+# aliases.json per node (see _load_aliases).
+
+_EN_RU_MAP: dict[str, str] = {
+    # Core concepts
+    "agent": "агент",
+    "agents": "агенты",
+    "graph": "граф",
+    "node": "узел",
+    "nodes": "узлы",
+    "edge": "ребро",
+    "project": "проект",
+    "task": "задача",
+    "role": "роль",
+    "code": "код",
+    "file": "файл",
+    "repo": "репо",
+    "repository": "репозиторий",
+    "branch": "ветка",
+    "commit": "коммит",
+    "memory": "память",
+    "library": "библиотека",
+    "module": "модуль",
+    "service": "сервис",
+    "config": "конфиг",
+    # Domain-specific (agents-brain)
+    "brain": "мозг",
+    "librarian": "библиотекарь",
+    "director": "директор",
+    "worker": "воркер",
+    "head": "хэд",
+    "drafter": "драфтер",
+    # Actions
+    "query": "запрос",
+    "write": "запись",
+    "read": "чтение",
+    "review": "ревью",
+    "audit": "аудит",
+    "decision": "решение",
+    "lesson": "урок",
+    "pattern": "паттерн",
+    "convention": "конвенция",
+}
+
+# Union map: term (either lang, lowercase) → list of equivalents including self.
+_TRANSLIT_MAP: dict[str, list[str]] = {}
+for _en, _ru in _EN_RU_MAP.items():
+    _TRANSLIT_MAP.setdefault(_en, []).extend([_en, _ru])
+    _TRANSLIT_MAP.setdefault(_ru, []).extend([_ru, _en])
+
+
+def _expand_term(term: str) -> list[str]:
+    """Return lower-cased variants for a search term — original + EN↔RU
+    equivalent if in _TRANSLIT_MAP. Deduplicated, preserves order."""
+    term_low = _strip_diacritics(term).lower()
+    variants = _TRANSLIT_MAP.get(term_low)
+    if variants:
+        return list(dict.fromkeys(_strip_diacritics(v).lower() for v in variants))
+    return [term_low]
+
+
+# Aliases cache: module-level, re-read on file mtime change. Librarian writes
+# the file on each cycle; MCP picks up updates without restart.
+_ALIASES_CACHE: dict[str, list[str]] = {}
+_ALIASES_MTIME: float = 0.0
+
+
+def _aliases_path() -> str:
+    return os.environ.get(
+        "GRAPHIFY_ALIASES_PATH",
+        os.path.expanduser("~/ai-infra/ops/graphify/aliases.json"),
+    )
+
+
+def _load_aliases(path: str) -> dict[str, list[str]]:
+    """Parse aliases.json (node_id → [alias strings]). Returns {} on any
+    failure — missing file, invalid JSON, wrong schema are all non-fatal."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for node_id, aliases in raw.items():
+        if not isinstance(aliases, list):
+            continue
+        out[node_id] = [
+            _strip_diacritics(a).lower()
+            for a in aliases if isinstance(a, str) and a
+        ]
+    return out
+
+
+def _get_aliases() -> dict[str, list[str]]:
+    global _ALIASES_CACHE, _ALIASES_MTIME
+    path = _aliases_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return _ALIASES_CACHE
+    if mtime > _ALIASES_MTIME:
+        _ALIASES_CACHE = _load_aliases(path)
+        _ALIASES_MTIME = mtime
+    return _ALIASES_CACHE
+# --- end agents-brain fork ------------------------------------------------
+
+
+def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str, list[str]]]:
+    """Оценивает узлы графа по похожести на query terms.
+
+    Возвращает tuple (score, node_id, match_paths). match_paths — список
+    уникальных путей совпадения (в порядке приоритета label > alias >
+    translit > source), по которым term'ы зацепились. Используется для
+    «match explainer» в query_graph output — агент видит ПОЧЕМУ узел нашёлся.
+
+    Backward compat: вызывающий код, который разрабатывался под
+    (score, nid), может делать `_, nid = ...` через unpack — получит
+    ошибку. Все in-tree вызовы обновлены.
+    """
     scored = []
-    norm_terms = [_strip_diacritics(t).lower() for t in terms]
+    expanded_terms: list[tuple[str, list[str]]] = [
+        (_strip_diacritics(t).lower(), _expand_term(t)) for t in terms
+    ]
+    aliases_map = _get_aliases()
     for nid, data in G.nodes(data=True):
         norm_label = data.get("norm_label") or _strip_diacritics(data.get("label") or "").lower()
         source = (data.get("source_file") or "").lower()
-        score = sum(1 for t in norm_terms if t in norm_label) + sum(0.5 for t in norm_terms if t in source)
+        node_aliases = aliases_map.get(nid, [])
+        score = 0.0
+        paths: set[str] = set()
+        for orig_norm, variants in expanded_terms:
+            # Проверяем в порядке приоритета: label > alias > source.
+            # Для каждого — перебираем variants; если матч случился на variant
+            # отличном от original, помечаем translit (substring через EN↔RU).
+            matched = False
+
+            for v in variants:
+                if v in norm_label:
+                    score += 1.0
+                    paths.add("translit" if v != orig_norm else "label")
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            for v in variants:
+                if node_aliases and any(v in a for a in node_aliases):
+                    score += 0.75
+                    paths.add("translit" if v != orig_norm else "alias")
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            for v in variants:
+                if v in source:
+                    score += 0.5
+                    paths.add("translit" if v != orig_norm else "source")
+                    break
         if score > 0:
-            scored.append((score, nid))
-    return sorted(scored, reverse=True)
+            # Стабильный порядок: label, alias, translit, source
+            order = {"label": 0, "alias": 1, "translit": 2, "source": 3}
+            path_list = sorted(paths, key=lambda p: order.get(p, 99))
+            scored.append((score, nid, path_list))
+    return sorted(scored, reverse=True, key=lambda x: (x[0], x[1]))
 
 
 def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
@@ -110,11 +271,92 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
 
 
 def _find_node(G: nx.Graph, label: str) -> list[str]:
-    """Return node IDs whose label or ID matches the search term (diacritic-insensitive)."""
-    term = _strip_diacritics(label).lower()
-    return [nid for nid, d in G.nodes(data=True)
-            if term in (d.get("norm_label") or _strip_diacritics(d.get("label") or "").lower())
-            or term == nid.lower()]
+    """Return node IDs whose label, ID, or alias matches the search term
+    (diacritic-insensitive, EN↔RU aware)."""
+    variants = _expand_term(label)
+    aliases_map = _get_aliases()
+    matches: list[str] = []
+    for nid, d in G.nodes(data=True):
+        norm_label = d.get("norm_label") or _strip_diacritics(d.get("label") or "").lower()
+        nid_lower = nid.lower()
+        if any(v in norm_label or v == nid_lower for v in variants):
+            matches.append(nid)
+            continue
+        node_aliases = aliases_map.get(nid, [])
+        if node_aliases and any(any(v in a for a in node_aliases) for v in variants):
+            matches.append(nid)
+    return matches
+
+
+def _suggest_labels(G: nx.Graph, query: str, k: int = 3) -> list[str]:
+    """Token-level fuzzy suggestions: для каждого слова query'я находит
+    label'ы где есть похожее слово через SequenceMatcher ratio >= 0.7.
+    Считаем score labels по числу matched tokens, возвращаем top-k.
+
+    Это NOT замена aliases — aliases уже работали в _score_nodes. Это
+    fallback от typo'ов и near-miss'ов: 'librariian' → 'Librarian',
+    'repowie' → 'Repowire Mesh Communication', 'pre tool' → 'PreToolUse ...'.
+    """
+    from difflib import SequenceMatcher
+
+    q_tokens = [
+        _strip_diacritics(w).lower()
+        for w in query.split()
+        if len(w) >= 3
+    ]
+    if not q_tokens:
+        return []
+
+    # Расширяем через EN↔RU map (pow'im 'agent' если искали 'агент')
+    expanded: set[str] = set(q_tokens)
+    for w in list(q_tokens):
+        for v in _TRANSLIT_MAP.get(w, []):
+            expanded.add(_strip_diacritics(v).lower())
+
+    # Индекс: label → [token, token, ...] один раз за вызов
+    import re as _re
+    labels_tokens: list[tuple[str, list[str]]] = []
+    seen_labels: set[str] = set()
+    for nid, d in G.nodes(data=True):
+        label = d.get("label") or nid
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        norm = d.get("norm_label") or _strip_diacritics(label).lower()
+        tokens = [t for t in _re.split(r"\W+", norm) if len(t) >= 3]
+        if tokens:
+            labels_tokens.append((label, tokens))
+
+    # Score: для каждого слова query — max ratio против label-words
+    scored: list[tuple[float, str]] = []
+    for label, tokens in labels_tokens:
+        score = 0.0
+        for qt in expanded:
+            best = 0.0
+            for lt in tokens:
+                # Быстрый skip для очевидно далёких слов
+                if abs(len(lt) - len(qt)) > 3 and qt not in lt and lt not in qt:
+                    continue
+                r = SequenceMatcher(None, qt, lt).ratio()
+                if r > best:
+                    best = r
+                    if best >= 0.95:
+                        break
+            if best >= 0.7:
+                score += best
+        if score > 0:
+            scored.append((score, label))
+    scored.sort(reverse=True)
+    return [label for _, label in scored[:k]]
+
+
+def _no_match_message(G: nx.Graph, query: str, kind: str = "node") -> str:
+    """Унифицированное сообщение о промахе с suggestions."""
+    suggestions = _suggest_labels(G, query, k=3)
+    base = f"No matching {kind} found for {query!r}."
+    if suggestions:
+        return base + " Did you mean: " + ", ".join(f"'{s}'" for s in suggestions) + "?"
+    return base + " Try: god_nodes() to browse top concepts, or graph_stats() for scope."
 
 
 def _filter_blank_stdin() -> None:
@@ -241,20 +483,36 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
         budget = int(arguments.get("token_budget", 2000))
         terms = [t.lower() for t in question.split() if len(t) > 2]
         scored = _score_nodes(G, terms)
-        start_nodes = [nid for _, nid in scored[:3]]
+        start_tuples = scored[:3]   # [(score, nid, paths), ...]
+        start_nodes = [nid for _, nid, _ in start_tuples]
         if not start_nodes:
-            return "No matching nodes found."
+            return _no_match_message(G, question, kind="nodes")
         nodes, edges = _dfs(G, start_nodes, depth) if mode == "dfs" else _bfs(G, start_nodes, depth)
-        header = f"Traversal: {mode.upper()} depth={depth} | Start: {[G.nodes[n].get('label', n) for n in start_nodes]} | {len(nodes)} nodes found\n\n"
+
+        # Match explainer: для каждого start-node выдаём как он нашёлся —
+        # substring на label, через alias (aliases.json), через EN↔RU
+        # translit, или через source-path. Помогает агенту понять почему
+        # именно эти узлы выбраны и как переформулировать в случае noise.
+        start_annotated = []
+        for score, nid, paths in start_tuples:
+            label = G.nodes[nid].get('label', nid)
+            path_str = "+".join(paths) if paths else "?"
+            start_annotated.append(f"'{label}' [via={path_str} score={score:.2f}]")
+
+        header = (
+            f"Traversal: {mode.upper()} depth={depth} | "
+            f"{len(nodes)} nodes found\n"
+            f"Start ranked: {', '.join(start_annotated)}\n\n"
+        )
         return header + _subgraph_to_text(G, nodes, edges, budget)
 
     def _tool_get_node(arguments: dict) -> str:
-        label = arguments["label"].lower()
-        matches = [(nid, d) for nid, d in G.nodes(data=True)
-                   if label in (d.get("label") or "").lower() or label == nid.lower()]
+        label = arguments["label"]
+        matches = _find_node(G, label)
         if not matches:
-            return f"No node matching '{label}' found."
-        nid, d = matches[0]
+            return _no_match_message(G, label, kind="node")
+        nid = matches[0]
+        d = G.nodes[nid]
         return "\n".join([
             f"Node: {d.get('label', nid)}",
             f"  ID: {nid}",
@@ -269,7 +527,7 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
         rel_filter = arguments.get("relation_filter", "").lower()
         matches = _find_node(G, label)
         if not matches:
-            return f"No node matching '{label}' found."
+            return _no_match_message(G, label, kind="node")
         nid = matches[0]
         lines = [f"Neighbors of {G.nodes[nid].get('label', nid)}:"]
         for neighbor in G.neighbors(nid):
@@ -314,9 +572,9 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
         src_scored = _score_nodes(G, [t.lower() for t in arguments["source"].split()])
         tgt_scored = _score_nodes(G, [t.lower() for t in arguments["target"].split()])
         if not src_scored:
-            return f"No node matching source '{arguments['source']}' found."
+            return _no_match_message(G, arguments["source"], kind="source node")
         if not tgt_scored:
-            return f"No node matching target '{arguments['target']}' found."
+            return _no_match_message(G, arguments["target"], kind="target node")
         src_nid, tgt_nid = src_scored[0][1], tgt_scored[0][1]
         max_hops = int(arguments.get("max_hops", 8))
         try:
