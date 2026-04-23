@@ -1144,7 +1144,7 @@ def main() -> None:
         if not scored:
             print("No matching nodes found.")
             sys.exit(0)
-        start = [nid for _, nid in scored[:5]]
+        start = [nid for _, nid, _ in scored[:5]]
         nodes, edges = (_dfs if use_dfs else _bfs)(G, start, depth=2)
         print(_subgraph_to_text(G, nodes, edges, token_budget=budget))
     elif cmd == "save-result":
