@@ -22,3 +22,5 @@ docs/superpowers/
 .vscode/
 openspec/
 uv.lock
+.opencode/
+opencode.json
